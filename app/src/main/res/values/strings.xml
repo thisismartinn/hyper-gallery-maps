@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">HyperGallery Maps</string>
+    <string name="module_description">Injects Google Maps tiles and global reverse geocoding into Xiaomi HyperOS Gallery (replacing Baidu Maps and Chinese location names).</string>
+</resources>
