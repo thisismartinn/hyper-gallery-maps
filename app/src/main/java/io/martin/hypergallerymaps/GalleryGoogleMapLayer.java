@@ -4,10 +4,13 @@ import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
+import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.PorterDuff;
 import android.graphics.Rect;
 import android.graphics.RectF;
+import android.graphics.Typeface;
+import android.graphics.drawable.Drawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -48,16 +51,16 @@ import java.util.concurrent.ConcurrentHashMap;
  * {@code MapContainer} and the photo-detail {@code StaticMapContainer}).
  *
  * <p>Adapted from XApps's {@code GoogleMapLayer}: Baidu's native map engine, clustering, pins, and
- * gestures remain untouched while Baidu's base map, POI labels, custom style, and logo are turned
- * off. Because Gallery initializes maps via {@code TextureMapView.getMap()} rather than
- * {@code BaiduMap.setMapType()}, this layer attaches on {@code getMap()} and re-asserts on map
- * load and {@code setMapType()}. If Google tiles are unreachable, Baidu's map is restored.
+ * gestures remain untouched while Baidu's base map, POI labels, and custom style are turned off,
+ * and Baidu's logo is replaced with a Google watermark. Because Gallery initializes maps via
+ * {@code TextureMapView.getMap()} and waits for {@code onMapLoaded()} before adding photo pins,
+ * this layer attaches inside an {@code OnMapLoadedCallback} proxy. If Google tiles are
+ * unreachable, Baidu's map and logo are restored.
  */
 final class GalleryGoogleMapLayer {
     private static final String MAP = "com.baidu.mapapi.map.";
     private static final String LAYER_PROP = "io.martin.hypergallerymaps.googlemap.layer";
     private static final int SIZE = 256;
-    private static final int BANDS = 4;
     private static final int MAX_QUEUE = 48;
     private static final int MAX_SHARPEN = 200;
     private static final int MAX_ZOOM = 21;
@@ -69,20 +72,21 @@ final class GalleryGoogleMapLayer {
     private static final long DISK_AGE_MS = 60L * 24 * 60 * 60 * 1000;
     private static final int MAX_PLAN = 600;
     private static final int MISSES_PER_SLEEP = 16;
+    private static final Paint BITMAP_PAINT = new Paint(Paint.FILTER_BITMAP_FLAG);
 
     private final Hooks hooks;
     private final ClassLoader loader;
     private final Map<Object, Boolean> attached = Collections.synchronizedMap(new WeakHashMap<>());
-    private final Map<Long, Bundle> tiles = Collections.synchronizedMap(new LinkedHashMap<Long, Bundle>(256, 0.75f, true) {
+    private final Map<Long, Bundle> tiles = Collections.synchronizedMap(new LinkedHashMap<Long, Bundle>(384, 0.75f, true) {
         @Override
         protected boolean removeEldestEntry(Map.Entry<Long, Bundle> eldest) {
-            return size() > 256;
+            return size() > 384;
         }
     });
-    private final Map<Long, Boolean> deliveredTiles = Collections.synchronizedMap(new LinkedHashMap<Long, Boolean>(256, 0.75f, false) {
+    private final Map<Long, Boolean> deliveredTiles = Collections.synchronizedMap(new LinkedHashMap<Long, Boolean>(384, 0.75f, false) {
         @Override
         protected boolean removeEldestEntry(Map.Entry<Long, Boolean> eldest) {
-            return size() > 240;
+            return size() > 360;
         }
     });
     private final ArrayDeque<Job> preload = new ArrayDeque<>();
@@ -96,17 +100,19 @@ final class GalleryGoogleMapLayer {
     private volatile long lastTouchAt;
     private final Set<ViewGroup> mapViews = Collections.newSetFromMap(new WeakHashMap<>());
     private final ArrayList<View> covers = new ArrayList<>();
-    private final Map<String, Bitmap> sources = Collections.synchronizedMap(new LinkedHashMap<String, Bitmap>(128, 0.75f, true) {
+    private final Map<String, Bitmap> sources = Collections.synchronizedMap(new LinkedHashMap<String, Bitmap>(192, 0.75f, true) {
         @Override
         protected boolean removeEldestEntry(Map.Entry<String, Bitmap> eldest) {
-            return size() > 96;
+            return size() > 160;
         }
     });
     private final ConcurrentHashMap<String, Object> sourceLocks = new ConcurrentHashMap<>();
     private final Set<Long> pending = ConcurrentHashMap.newKeySet();
     private final ArrayDeque<Job> queue = new ArrayDeque<>();
-    private final Set<View> logos = Collections.newSetFromMap(new WeakHashMap<>());
+    private final Map<ImageView, Drawable> originalLogos = Collections.synchronizedMap(new WeakHashMap<>());
     private final ThreadLocal<Bitmap> canvasBitmap = new ThreadLocal<>();
+    private final ThreadLocal<Canvas> tileCanvas = new ThreadLocal<>();
+    private volatile Bitmap googleLogoBitmap;
 
     private volatile long failedUntil;
     private volatile boolean satellite;
@@ -173,6 +179,7 @@ final class GalleryGoogleMapLayer {
             return;
         }
         System.setProperty(LAYER_PROP, "on");
+        System.setProperty("http.maxConnections", "16");
 
         geoPoint = loader.loadClass("com.baidu.platform.comapi.basestruct.GeoPoint")
                 .getConstructor(double.class, double.class);
@@ -389,22 +396,95 @@ final class GalleryGoogleMapLayer {
     private void hideLogo(ViewGroup view) {
         for (int i = 0; i < view.getChildCount(); i++) {
             View child = view.getChildAt(i);
-            if (child instanceof ImageView) {
-                child.setVisibility(View.GONE);
-                synchronized (logos) {
-                    logos.add(child);
+            if (child instanceof ImageView imageView) {
+                synchronized (originalLogos) {
+                    if (!originalLogos.containsKey(imageView)) {
+                        originalLogos.put(imageView, imageView.getDrawable());
+                    }
+                }
+                Bitmap logo = getGoogleLogoBitmap(view.getContext());
+                if (logo != null) {
+                    imageView.setAdjustViewBounds(true);
+                    imageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                    imageView.setImageBitmap(logo);
+                    imageView.setVisibility(View.VISIBLE);
+                } else {
+                    imageView.setVisibility(View.GONE);
                 }
             }
         }
     }
 
-    /** Google is unreachable: restore Baidu's map rather than showing an empty screen. */
+    /** Renders a crisp density-scaled Google wordmark matching Google Maps' bottom-left watermark. */
+    private Bitmap getGoogleLogoBitmap(Context context) {
+        Bitmap existing = googleLogoBitmap;
+        if (existing != null && !existing.isRecycled()) return existing;
+        try {
+            float density = context.getResources().getDisplayMetrics().density;
+            float textSize = 15.5f * density;
+            Typeface typeface = Typeface.create("sans-serif-medium", Typeface.BOLD);
+
+            Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+            fill.setTextSize(textSize);
+            fill.setTypeface(typeface);
+            fill.setStyle(Paint.Style.FILL);
+
+            Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+            stroke.setTextSize(textSize);
+            stroke.setTypeface(typeface);
+            stroke.setStyle(Paint.Style.STROKE);
+            stroke.setStrokeWidth(2.6f * density);
+            stroke.setStrokeJoin(Paint.Join.ROUND);
+            stroke.setColor(Color.argb(225, 255, 255, 255));
+
+            String word = "Google";
+            int[] colors = {
+                    0xFF4285F4, // G - Blue
+                    0xFFEA4335, // o - Red
+                    0xFFFBBC05, // o - Yellow
+                    0xFF4285F4, // g - Blue
+                    0xFF34A853, // l - Green
+                    0xFFEA4335  // e - Red
+            };
+
+            float padX = 3f * density;
+            float padY = 2.5f * density;
+            Paint.FontMetrics fm = fill.getFontMetrics();
+            float textWidth = fill.measureText(word);
+            int width = Math.max(1, (int) Math.ceil(textWidth + padX * 2));
+            int height = Math.max(1, (int) Math.ceil((fm.descent - fm.ascent) + padY * 2));
+            float baseline = padY - fm.ascent;
+
+            Bitmap bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+            Canvas c = new Canvas(bmp);
+            float x = padX;
+            for (int i = 0; i < word.length(); i++) {
+                String ch = word.substring(i, i + 1);
+                c.drawText(ch, x, baseline, stroke);
+                fill.setColor(colors[i]);
+                c.drawText(ch, x, baseline, fill);
+                x += fill.measureText(ch);
+            }
+            googleLogoBitmap = bmp;
+            return bmp;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /** Google is unreachable: restore Baidu's map and logo rather than showing an empty screen. */
     private void fallBack() {
         fallback = true;
         hooks.info("Gallery: Google map unreachable, falling back to Baidu");
         mainHandler.post(() -> {
-            synchronized (logos) {
-                for (View logo : logos) logo.setVisibility(View.VISIBLE);
+            synchronized (originalLogos) {
+                for (Map.Entry<ImageView, Drawable> entry : originalLogos.entrySet()) {
+                    ImageView iv = entry.getKey();
+                    if (iv != null) {
+                        iv.setImageDrawable(entry.getValue());
+                        iv.setVisibility(View.VISIBLE);
+                    }
+                }
             }
             synchronized (attached) {
                 for (Object map : attached.keySet()) {
@@ -481,7 +561,7 @@ final class GalleryGoogleMapLayer {
         int plannedZoom = 0, plannedX = 0, plannedY = 0;
         while (!fallback) {
             try {
-                Thread.sleep(350);
+                Thread.sleep(250);
                 int zoom, minX, maxX, minY, maxY;
                 synchronized (viewLock) {
                     zoom = viewZoom;
@@ -503,8 +583,8 @@ final class GalleryGoogleMapLayer {
                 boolean metered = metered();
                 boolean photo = satellite;
                 ArrayDeque<int[]> wanted = new ArrayDeque<>();
-                double[][] steps = metered ? new double[][]{{0, 1}, {1, 0.5}, {-1, 1}}
-                        : new double[][]{{0, 2}, {1, 0.75}, {-1, 2}, {2, 0.4}, {-2, 2}};
+                double[][] steps = metered ? new double[][]{{0, 1.2}, {1, 0.7}, {-1, 1}}
+                        : new double[][]{{0, 2}, {1, 0.9}, {2, 0.5}, {-1, 2}, {-2, 1.5}};
                 for (double[] step : steps) {
                     addLevel(wanted, southWest, northEast, zoom - 1 + (int) step[0], step[1], photo);
                 }
@@ -683,17 +763,17 @@ final class GalleryGoogleMapLayer {
         if (refreshPosted) return;
         refreshPosted = true;
         refreshWanted = SystemClock.elapsedRealtime();
-        mainHandler.postDelayed(this::refreshWhenStill, 200);
+        mainHandler.postDelayed(this::refreshWhenStill, 120);
     }
 
     private void refreshWhenStill() {
         long now = SystemClock.elapsedRealtime();
-        boolean busy;
+        boolean sharpening;
         synchronized (queue) {
-            busy = !sharpen.isEmpty() || !queue.isEmpty();
+            sharpening = !sharpen.isEmpty();
         }
-        if (now - lastTouchAt < 400 || (busy && now - refreshWanted < 2000)) {
-            mainHandler.postDelayed(this::refreshWhenStill, 150);
+        if (now - lastTouchAt < 220 || (sharpening && now - refreshWanted < 700)) {
+            mainHandler.postDelayed(this::refreshWhenStill, 100);
             return;
         }
         refreshPosted = false;
@@ -712,7 +792,7 @@ final class GalleryGoogleMapLayer {
                 }
             }
         }
-        if (cover != null) mainHandler.postDelayed(this::removeCovers, 350);
+        if (cover != null) mainHandler.postDelayed(this::removeCovers, 200);
     }
 
     private View coverMaps() {
@@ -774,23 +854,32 @@ final class GalleryGoogleMapLayer {
         double south = y * span;
         double world = SIZE * Math.pow(2, level);
         Bitmap out = canvasBitmap.get();
-        if (out == null) {
+        Canvas canvas = tileCanvas.get();
+        if (out == null || canvas == null) {
             out = Bitmap.createBitmap(SIZE, SIZE, Bitmap.Config.ARGB_8888);
+            canvas = new Canvas(out);
             canvasBitmap.set(out);
+            tileCanvas.set(canvas);
         }
-        Canvas canvas = new Canvas(out);
         canvas.drawColor(0, PorterDuff.Mode.CLEAR);
-        Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG);
         double[] bottomLeft = point(west, south);
         double[] topRight = point(west + span, south + span);
         double left = worldX(bottomLeft[1], world);
         double right = worldX(topRight[1], world);
-        for (int band = 0; band < BANDS; band++) {
-            double top = worldY(point(west, south + span * (BANDS - band) / BANDS)[0], world);
-            double bottom = worldY(point(west, south + span * (BANDS - band - 1) / BANDS)[0], world);
-            float bandTop = SIZE * band / (float) BANDS;
-            float bandBottom = SIZE * (band + 1) / (float) BANDS;
-            int count = 1 << level;
+        // At zoom >= 8, projection curvature across a single 256px tile is < 0.05px, so 1 band is 4x faster.
+        int bands = zoom >= 8 ? 1 : 4;
+        int count = 1 << level;
+        Rect from = new Rect();
+        RectF to = new RectF();
+        for (int band = 0; band < bands; band++) {
+            double top = bands == 1
+                    ? worldY(topRight[0], world)
+                    : worldY(point(west, south + span * (bands - band) / bands)[0], world);
+            double bottom = bands == 1
+                    ? worldY(bottomLeft[0], world)
+                    : worldY(point(west, south + span * (bands - band - 1) / bands)[0], world);
+            float bandTop = SIZE * band / (float) bands;
+            float bandBottom = SIZE * (band + 1) / (float) bands;
             for (long gy = (long) Math.floor(top / SIZE); gy <= (long) Math.floor((bottom - 1e-6) / SIZE); gy++) {
                 if (gy < 0 || gy >= count) continue;
                 for (long gx = (long) Math.floor(left / SIZE); gx <= (long) Math.floor((right - 1e-6) / SIZE); gx++) {
@@ -801,21 +890,21 @@ final class GalleryGoogleMapLayer {
                     double toX = Math.min(right, (gx + 1) * SIZE);
                     double fromY = Math.max(top, gy * SIZE);
                     double toY = Math.min(bottom, (gy + 1) * SIZE);
-                    Rect from = new Rect((int) Math.round((fromX - gx * SIZE) * sourceScale),
+                    from.set((int) Math.round((fromX - gx * SIZE) * sourceScale),
                             (int) Math.round((fromY - gy * SIZE) * sourceScale),
                             (int) Math.round((toX - gx * SIZE) * sourceScale),
                             (int) Math.round((toY - gy * SIZE) * sourceScale));
-                    RectF to = new RectF((float) ((fromX - left) / (right - left) * SIZE),
+                    to.set((float) ((fromX - left) / (right - left) * SIZE),
                             (float) (bandTop + (fromY - top) / (bottom - top) * (bandBottom - bandTop)),
                             (float) ((toX - left) / (right - left) * SIZE),
                             (float) (bandTop + (toY - top) / (bottom - top) * (bandBottom - bandTop)));
-                    canvas.drawBitmap(source, from, to, paint);
+                    canvas.drawBitmap(source, from, to, BITMAP_PAINT);
                 }
             }
         }
-        ByteBuffer pixels = ByteBuffer.allocate(SIZE * SIZE * 4);
-        out.copyPixelsToBuffer(pixels);
-        return pixels.array();
+        byte[] raw = new byte[SIZE * SIZE * 4];
+        out.copyPixelsToBuffer(ByteBuffer.wrap(raw));
+        return raw;
     }
 
     /**
