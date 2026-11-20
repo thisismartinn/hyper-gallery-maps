@@ -58,12 +58,12 @@ final class GalleryGoogleMapLayer {
     private static final String LAYER_PROP = "io.martin.hypergallerymaps.googlemap.layer";
     private static final int SIZE = 256;
     private static final int BANDS = 4;
-    private static final int MAX_QUEUE = 24;
+    private static final int MAX_QUEUE = 48;
     private static final int MAX_SHARPEN = 200;
     private static final int MAX_ZOOM = 21;
-    private static final int WORKERS = 4;
-    private static final int FETCHERS = 3;
-    private static final int WORKER_PRIORITY = 5;
+    private static final int WORKERS = 8;
+    private static final int FETCHERS = 4;
+    private static final int WORKER_PRIORITY = Process.THREAD_PRIORITY_DEFAULT;
     private static final int ENGINE_CACHE_BYTES = 64 * 1024 * 1024;
     private static final long DISK_BYTES = 100L * 1024 * 1024;
     private static final long DISK_AGE_MS = 60L * 24 * 60 * 60 * 1000;
@@ -96,12 +96,13 @@ final class GalleryGoogleMapLayer {
     private volatile long lastTouchAt;
     private final Set<ViewGroup> mapViews = Collections.newSetFromMap(new WeakHashMap<>());
     private final ArrayList<View> covers = new ArrayList<>();
-    private final Map<String, Bitmap> sources = Collections.synchronizedMap(new LinkedHashMap<String, Bitmap>(64, 0.75f, true) {
+    private final Map<String, Bitmap> sources = Collections.synchronizedMap(new LinkedHashMap<String, Bitmap>(128, 0.75f, true) {
         @Override
         protected boolean removeEldestEntry(Map.Entry<String, Bitmap> eldest) {
-            return size() > 48;
+            return size() > 96;
         }
     });
+    private final ConcurrentHashMap<String, Object> sourceLocks = new ConcurrentHashMap<>();
     private final Set<Long> pending = ConcurrentHashMap.newKeySet();
     private final ArrayDeque<Job> queue = new ArrayDeque<>();
     private final Set<View> logos = Collections.newSetFromMap(new WeakHashMap<>());
@@ -239,28 +240,46 @@ final class GalleryGoogleMapLayer {
             // Older/newer Baidu SDK variant.
         }
 
-        // Gallery attaches BaiduMap via TextureMapView.getMap() without calling setMapType().
+        // Gallery initializes BaiduMap via TextureMapView.getMap() and waits for onMapLoaded()
+        // before querying and rendering photo pins. Do NOT hide Baidu's basemap before onMapLoaded()
+        // fires, or onMapLoaded() may never trigger. Schedule a delayed fallback only for maps that
+        // never register an OnMapLoadedCallback.
         hooks.install(textureMapView.getMethod("getMap"), chain -> {
             Object map = chain.proceed();
             if (map != null && !fallback) {
-                attachIfNeeded(map);
+                mainHandler.postDelayed(() -> {
+                    if (!fallback && attached.get(map) == null) {
+                        attachIfNeeded(map);
+                    }
+                }, 1200);
             }
             return map;
         });
 
-        // Re-assert hiding Baidu base layers when the map finishes loading.
+        // Wrap OnMapLoadedCallback so original onMapLoaded() runs first (loading photo cluster pins),
+        // then immediately attach the Google Maps tile layer and hide Baidu's basemap.
         try {
             Class<?> loadedCb = loader.loadClass(MAP + "BaiduMap$OnMapLoadedCallback");
             hooks.install(baiduMap.getMethod("setOnMapLoadedCallback", loadedCb), chain -> {
-                Object result = chain.proceed();
+                Object orig = chain.getArg(0);
                 Object map = chain.getThisObject();
-                if (map != null && !fallback) {
-                    attachIfNeeded(map);
+                if (orig == null || map == null || fallback) {
+                    return chain.proceed();
                 }
-                return result;
+                Object proxy = java.lang.reflect.Proxy.newProxyInstance(
+                        loader,
+                        new Class<?>[]{loadedCb},
+                        (p, method, args) -> {
+                            Object r = method.invoke(orig, args);
+                            if ("onMapLoaded".equals(method.getName()) && !fallback) {
+                                attachIfNeeded(map);
+                            }
+                            return r;
+                        });
+                return chain.proceed(new Object[]{proxy});
             });
-        } catch (ReflectiveOperationException ignored) {
-            // Optional safety hook.
+        } catch (ReflectiveOperationException failure) {
+            hooks.info("Gallery: OnMapLoadedCallback hook unavailable: " + failure.getClass().getSimpleName());
         }
 
         // Touch hooks for smooth preview-to-sharp cover swap timing.
@@ -462,7 +481,7 @@ final class GalleryGoogleMapLayer {
         int plannedZoom = 0, plannedX = 0, plannedY = 0;
         while (!fallback) {
             try {
-                Thread.sleep(700);
+                Thread.sleep(350);
                 int zoom, minX, maxX, minY, maxY;
                 synchronized (viewLock) {
                     zoom = viewZoom;
@@ -664,7 +683,7 @@ final class GalleryGoogleMapLayer {
         if (refreshPosted) return;
         refreshPosted = true;
         refreshWanted = SystemClock.elapsedRealtime();
-        mainHandler.postDelayed(this::refreshWhenStill, 400);
+        mainHandler.postDelayed(this::refreshWhenStill, 200);
     }
 
     private void refreshWhenStill() {
@@ -673,8 +692,8 @@ final class GalleryGoogleMapLayer {
         synchronized (queue) {
             busy = !sharpen.isEmpty() || !queue.isEmpty();
         }
-        if (now - lastTouchAt < 700 || (busy && now - refreshWanted < 3000)) {
-            mainHandler.postDelayed(this::refreshWhenStill, 250);
+        if (now - lastTouchAt < 400 || (busy && now - refreshWanted < 2000)) {
+            mainHandler.postDelayed(this::refreshWhenStill, 150);
             return;
         }
         refreshPosted = false;
@@ -830,24 +849,39 @@ final class GalleryGoogleMapLayer {
         String key = fileName(x, y, level, photo);
         Bitmap cached = sources.get(key);
         if (cached != null) return cached;
-        File file = new File(disk(), key);
-        byte[] data = null;
-        if (file.isFile() && System.currentTimeMillis() - file.lastModified() < DISK_AGE_MS) {
-            try {
-                data = Files.readAllBytes(file.toPath());
-            } catch (IOException ignored) {
+        if (!network) {
+            File file = new File(disk(), key);
+            if (!file.isFile() || System.currentTimeMillis() - file.lastModified() >= DISK_AGE_MS) {
+                return null;
             }
         }
-        Bitmap image = data == null ? null : decode(data);
-        if (image == null) {
-            if (!network) return null;
-            data = download(x, y, level, photo);
-            image = decode(data);
-            if (image == null) throw new IOException("Bad image");
-            store(file, data);
+        Object lock = sourceLocks.computeIfAbsent(key, k -> new Object());
+        try {
+            synchronized (lock) {
+                cached = sources.get(key);
+                if (cached != null) return cached;
+                File file = new File(disk(), key);
+                byte[] data = null;
+                if (file.isFile() && System.currentTimeMillis() - file.lastModified() < DISK_AGE_MS) {
+                    try {
+                        data = Files.readAllBytes(file.toPath());
+                    } catch (IOException ignored) {
+                    }
+                }
+                Bitmap image = data == null ? null : decode(data);
+                if (image == null) {
+                    if (!network) return null;
+                    data = download(x, y, level, photo);
+                    image = decode(data);
+                    if (image == null) throw new IOException("Bad image");
+                    store(file, data);
+                }
+                sources.put(key, image);
+                return image;
+            }
+        } finally {
+            sourceLocks.remove(key, lock);
         }
-        sources.put(key, image);
-        return image;
     }
 
     private static String fileName(int x, int y, int level, boolean photo) {

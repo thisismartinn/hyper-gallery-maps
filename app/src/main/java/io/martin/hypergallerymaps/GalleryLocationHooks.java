@@ -133,26 +133,38 @@ final class GalleryLocationHooks {
         Class<?> geoClient = loader.loadClass("com.miui.gallery.map.location.GalleryGeoClientImpl");
 
         hooks.install(geoClient.getDeclaredMethod("parseFromLatLng", double.class, double.class), chain -> {
-            if (!Geocoder.isPresent()) return chain.proceed();
+            if (!Geocoder.isPresent()) {
+                hooks.info("Gallery: Geocoder not present, falling back to Baidu");
+                return chain.proceed();
+            }
             double lat = (Double) chain.getArg(0);
             double lng = (Double) chain.getArg(1);
-            return geocode(lat, lng);
+            Address result = geocode(lat, lng);
+            hooks.info("Gallery: parseFromLatLng resolved=" + (result != null));
+            return result;
         });
 
         hooks.install(geoClient.getDeclaredMethod("batchParseFromLatLngList", List.class), chain -> {
-            if (!Geocoder.isPresent()) return chain.proceed();
+            if (!Geocoder.isPresent()) {
+                hooks.info("Gallery: Geocoder not present, falling back to Baidu");
+                return chain.proceed();
+            }
             List<?> inputs = (List<?>) chain.getArg(0);
             if (inputs == null) return null;
             List<Address> results = new ArrayList<>(inputs.size());
+            int resolved = 0;
             for (Object item : inputs) {
                 if (item instanceof Pair<?, ?> pair
                         && pair.first instanceof Number latNum
                         && pair.second instanceof Number lngNum) {
-                    results.add(geocode(latNum.doubleValue(), lngNum.doubleValue()));
+                    Address addr = geocode(latNum.doubleValue(), lngNum.doubleValue());
+                    if (addr != null) resolved++;
+                    results.add(addr);
                 } else {
                     results.add(null);
                 }
             }
+            hooks.info("Gallery: batchParseFromLatLngList count=" + inputs.size() + " resolved=" + resolved);
             return results;
         });
     }
